@@ -1,26 +1,26 @@
 #include <Windows.h>
 #include <Xinput.h>
 #include <dsound.h>
+#include <stdio.h>
+#define _USE_MATH_DEFINES
 #include <math.h>
-
-#define M_PI 3.14159265358979323846
 
 struct DisplayBuffer {
 	BITMAPINFO info;
 	void *memory;
-	int width, height, pitch;
+	int width, height;
 };
 
 struct SoundBuffer {
 	int samples_per_second;
-	int tone_hz;
-	int tone_volume;
+	int frequency; // tone hz
+	int amplitude; // volume
 	int running_sample_index;
-	int wave_period;
+	int samples_per_cycle;
 	int bytes_per_sample;
 	int secondary_buffer_size;
-	double tsine;
-	int latency_sample_count;
+	float tsine;
+	// int latency_sample_count;
 };
 
 static DisplayBuffer back_buffer;
@@ -29,7 +29,6 @@ static LPDIRECTSOUNDBUFFER secondary_buffer;
 LRESULT CALLBACK main_callback(HWND wndw, UINT msg, WPARAM wp, LPARAM lp);
 void init_dib(DisplayBuffer *buf, int width, int height);
 void fill_display_buffer(DisplayBuffer *buf, int xoffset, int yoffset);
-
 void init_dsound(HWND hwnd, int samples_per_sec, int buf_sz);
 void fill_sound_buffer(SoundBuffer *buf, DWORD byte_to_lock, DWORD bytes_to_write);
 
@@ -48,13 +47,21 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev_inst, LPSTR cmd_line, int show
 	SHORT xstick, ystick;
 	int width, height;
 	HDC hdc;
-	RECT ClientRect;
+	RECT client_rect;
+	int xoffset, yoffset;
 
-	DWORD PlayCursor;
-	DWORD WriteCursor;
+	SoundBuffer sound_output;
+	DWORD play_cursor;
+	DWORD write_cursos;
 	DWORD bytes_to_write;
 	DWORD byte_to_lock;
-	DWORD TargetCursor;
+	DWORD target_cursor;
+
+	char buf[256];
+	LARGE_INTEGER start_time, end_time, elapsed_time;
+	LARGE_INTEGER count_frequency;
+	double mspf, fps;
+	unsigned int start_cycle_count, end_cycle_count, elapsed_cycles;
 
 	WNDCLASS wc = {
 		CS_HREDRAW | CS_VREDRAW,
@@ -84,24 +91,30 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev_inst, LPSTR cmd_line, int show
 	ShowWindow(hwnd, show_code);
 	UpdateWindow(hwnd);
 
-	int xoffset = 0;
-	int yoffset = 0;
+	xoffset = 0;
+	yoffset = 0;
 
-	SoundBuffer sound_output;
 	sound_output.samples_per_second = 48000;
-	sound_output.tone_hz = 256;
-	sound_output.tone_volume = 3000;
-	sound_output.wave_period = sound_output.samples_per_second/sound_output.tone_hz;
-	sound_output.bytes_per_sample = sizeof(INT16)*2;
+	sound_output.frequency = 256; // cycles/second
+	sound_output.amplitude = 3000;
+	sound_output.running_sample_index = 0;
+	sound_output.samples_per_cycle = sound_output.samples_per_second / sound_output.frequency;
+	sound_output.bytes_per_sample = sizeof(INT16) * 2;
 	sound_output.secondary_buffer_size = sound_output.samples_per_second*sound_output.bytes_per_sample;
-	sound_output.latency_sample_count = sound_output.samples_per_second/15;
+	sound_output.tsine = 0;
+	// sound_output.latency_sample_count = sound_output.samples_per_second / 15;
 
 	init_dsound(hwnd, sound_output.samples_per_second, sound_output.secondary_buffer_size);
-	fill_sound_buffer(&sound_output, 0, sound_output.latency_sample_count*sound_output.bytes_per_sample);
+	fill_sound_buffer(&sound_output, 0, sound_output.secondary_buffer_size); // sound_output.latency_sample_count*sound_output.bytes_per_sample
 	secondary_buffer->Play(0, 0, DSBPLAY_LOOPING);
+
+	QueryPerformanceFrequency(&count_frequency);
 
 	msg.message = WM_NULL;
 	while (WM_QUIT != msg.message) {
+		QueryPerformanceCounter(&start_time);
+		start_cycle_count = __rdtsc();
+
 		while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
 			TranslateMessage(&msg);
 			DispatchMessage(&msg);
@@ -133,36 +146,37 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev_inst, LPSTR cmd_line, int show
 				xoffset -= xstick / 4096;
 				yoffset += ystick / 4096;
 
-				if(Abutton)
+				if (Abutton)
 					yoffset--;
-				if(Bbutton)
+				if (Bbutton)
 					xoffset--;
-				if(Xbutton)
+				if (Xbutton)
 					xoffset++;
-				if(Ybutton)
+				if (Ybutton)
 					yoffset++;
 
-				sound_output.tone_hz = 512 + (int)(256.0*((float)ystick / 30000.0));
-				sound_output.wave_period = sound_output.samples_per_second/sound_output.tone_hz;
+				sound_output.frequency = 512 + (int)(256.0*((float)ystick / 30000.0));
+				sound_output.samples_per_cycle = sound_output.samples_per_second / sound_output.frequency;
 			}
 		}
 
-		secondary_buffer->GetCurrentPosition(&PlayCursor, &WriteCursor);
+		secondary_buffer->GetCurrentPosition(&play_cursor, &write_cursos);
 		byte_to_lock = ((sound_output.running_sample_index*sound_output.bytes_per_sample) % sound_output.secondary_buffer_size);
-		TargetCursor = ((PlayCursor + (sound_output.latency_sample_count*sound_output.bytes_per_sample)) % sound_output.secondary_buffer_size);
-		if(byte_to_lock > TargetCursor) {
+		target_cursor = ((play_cursor + sound_output.secondary_buffer_size) % sound_output.secondary_buffer_size); // sound_output.latency_sample_count*sound_output.bytes_per_sample for first one
+		if (byte_to_lock > target_cursor) {
 			bytes_to_write = (sound_output.secondary_buffer_size - byte_to_lock);
-			bytes_to_write += TargetCursor;
-		} else {
-			bytes_to_write = TargetCursor - byte_to_lock;
+			bytes_to_write += target_cursor;
+		}
+		else {
+			bytes_to_write = target_cursor - byte_to_lock;
 		}
 		fill_sound_buffer(&sound_output, byte_to_lock, bytes_to_write);
 
 		fill_display_buffer(&back_buffer, xoffset, yoffset);
 		hdc = GetDC(hwnd);
-		GetClientRect(hwnd, &ClientRect);
-		width = ClientRect.right - ClientRect.left;
-		height = ClientRect.bottom - ClientRect.top;
+		GetClientRect(hwnd, &client_rect);
+		width = client_rect.right - client_rect.left;
+		height = client_rect.bottom - client_rect.top;
 		StretchDIBits(hdc,
 			0, 0, width, height,
 			0, 0, back_buffer.width, back_buffer.height,
@@ -171,6 +185,26 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev_inst, LPSTR cmd_line, int show
 			DIB_RGB_COLORS,
 			SRCCOPY);
 		ReleaseDC(hwnd, hdc);
+
+		end_cycle_count = __rdtsc();
+		QueryPerformanceCounter(&end_time);
+		elapsed_time.QuadPart = end_time.QuadPart - start_time.QuadPart;
+
+		fps = (double)count_frequency.QuadPart / (double)elapsed_time.QuadPart;
+
+		elapsed_time.QuadPart *= 1000; // convert to milliseconds
+		mspf = (double)elapsed_time.QuadPart / (double)count_frequency.QuadPart; // convert to milliseconds per frame
+
+		elapsed_cycles = end_cycle_count - start_cycle_count;
+		double MCPF = (double)elapsed_cycles / (1000.0 * 1000.0);
+
+		// fps * MCPF is the GHz for the processor
+
+		sprintf_s(buf, "%.02f ms/f,  %.02f f/s,  %.02f mc/f\n", mspf, fps, MCPF);
+		OutputDebugStringA(buf);
+
+		start_time = end_time;
+		start_cycle_count = end_cycle_count;
 	}
 
 	return msg.wParam;
@@ -280,7 +314,6 @@ void init_dib(DisplayBuffer *buf, int width, int height)
 
 	buf->width = width;
 	buf->height = height;
-	buf->pitch = width*bytes_per_pixel;
 }
 
 void fill_display_buffer(DisplayBuffer *back_buffer, int xoffset, int yoffset)
@@ -289,6 +322,7 @@ void fill_display_buffer(DisplayBuffer *back_buffer, int xoffset, int yoffset)
 	BYTE *row;
 	UINT32 *pixel;
 	BYTE blue, green;
+	int bytes_per_pixel = 4;
 
 	row = (BYTE*)back_buffer->memory;
 	for (y = 0; y < back_buffer->height; ++y) {
@@ -298,13 +332,13 @@ void fill_display_buffer(DisplayBuffer *back_buffer, int xoffset, int yoffset)
 			green = y + yoffset;
 			*pixel++ = ((green << 8) | blue);
 		}
-		row += back_buffer->pitch;
+		row += back_buffer->width*bytes_per_pixel; // row += pitch;
 	}
 }
 
 void init_dsound(HWND hwnd, int samples_per_second, int buf_sz)
 {
-    WAVEFORMATEX wfx;
+	WAVEFORMATEX wfx;
 	DSBUFFERDESC dsbdesc;
 	LPDIRECTSOUND direct_sound;
 	LPDIRECTSOUNDBUFFER primary_buffer;
@@ -327,6 +361,7 @@ void init_dsound(HWND hwnd, int samples_per_second, int buf_sz)
 	dsbdesc.guid3DAlgorithm = GUID_NULL;
 
 	DirectSoundCreate(0, &direct_sound, 0);
+
 	direct_sound->SetCooperativeLevel(hwnd, DSSCL_PRIORITY);
 	direct_sound->CreateSoundBuffer(&dsbdesc, &primary_buffer, 0);
 	primary_buffer->SetFormat(&wfx);
@@ -340,41 +375,33 @@ void init_dsound(HWND hwnd, int samples_per_second, int buf_sz)
 
 void fill_sound_buffer(SoundBuffer *buf, DWORD byte_to_lock, DWORD bytes_to_write)
 {
-    VOID *region1, *region2;
-    DWORD region1sz, region2sz;
-	DWORD region1_sample_count, region2_sample_count;
+	VOID *region1, *region2;
+	DWORD region1sz, region2sz;
 	INT16 *sample_out;
 	DWORD sample_ind, sample_val;
-	float sin_val;
 
 	secondary_buffer->Lock(byte_to_lock, bytes_to_write,
-						&region1, &region1sz,
-						&region2, &region2sz,
-						0);
+		&region1, &region1sz,
+		&region2, &region2sz,
+		0);
 
-	region1_sample_count = region1sz/buf->bytes_per_sample;
 	sample_out = (INT16 *)region1;
-
-	for(sample_ind = 0; sample_ind < region1_sample_count; ++sample_ind) {
-		sin_val = sinf(buf->tsine);
-		sample_val = (INT16)(sin_val * buf->tone_volume);
+	for (sample_ind = 0; sample_ind < region1sz / buf->bytes_per_sample; ++sample_ind) { // max is region1_sample_count
+		sample_val = (INT16)(sinf(buf->tsine) * buf->amplitude);
 		*sample_out++ = sample_val;
 		*sample_out++ = sample_val;
 
-		buf->tsine += 2.0*M_PI*1.0/(float)buf->wave_period;
+		buf->tsine += 2.0*M_PI*1.0 / (float)buf->samples_per_cycle;
 		++buf->running_sample_index;
 	}
 
-	region2_sample_count = region2sz/buf->bytes_per_sample;
 	sample_out = (INT16 *)region2;
-
-	for(sample_ind = 0; sample_ind < region1_sample_count; ++sample_ind) {
-		sin_val = sinf(buf->tsine);
-		sample_val = (INT16)(sin_val * buf->tone_volume);
+	for (sample_ind = 0; sample_ind < region2sz / buf->bytes_per_sample; ++sample_ind) {
+		sample_val = (INT16)(sinf(buf->tsine) * buf->amplitude);
 		*sample_out++ = sample_val;
 		*sample_out++ = sample_val;
 
-		buf->tsine += 2.0*M_PI*1.0/(float)buf->wave_period;
+		buf->tsine += 2.0*M_PI*1.0 / (float)buf->samples_per_cycle;
 		++buf->running_sample_index;
 	}
 
